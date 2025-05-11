@@ -60,6 +60,7 @@ static std::tuple<Tensor, Tensor> sdpa_general_mps(const Tensor& query,
     MPSGraphTensor* outputTensor = nil;
     MPSGraphTensor* attnTensor = nil;
   };
+  std::cout << "general_mps" << std::endl;
   const auto macOS15_0_plus = is_macos_13_or_newer(MacOSVersion::MACOS_VER_15_0_PLUS);
   int64_t batchSize = query.size(0);
   int64_t num_head = query.size(1);
@@ -147,6 +148,113 @@ static std::tuple<Tensor, Tensor> sdpa_general_mps(const Tensor& query,
 
   return {std::move(final_out), std::move(final_attn)};
 }
+
+
+static std::tuple<Tensor, Tensor> flash_mps(const Tensor& q_,
+                                                       const Tensor& k_,
+                                                       const Tensor& v_,
+                                                       const std::optional<Tensor>& mask_,
+                                                       double dropout_p,
+                                                       bool is_causal,
+                                                       const std::optional<Tensor>& dropout_mask,
+                                                       std::optional<double> scale,
+                                                       const Tensor& orig_query,
+                                                       bool unsqueezed) {
+  const auto macOS15_0_plus = is_macos_13_or_newer(MacOSVersion::MACOS_VER_15_0_PLUS);
+
+  // constant int& batch_size [[buffer(6)]],
+  // constant int& num_heads [[buffer(7)]],
+  // constant int& seq_len [[buffer(8)]],
+  // constant int& head_dim [[buffer(9)]],
+  // (batch_size, seq_len, num_heads, head_dim)
+
+  std::cout << "flash_mps" << std::endl;
+  using namespace mps;
+  uint batchSize = q_.size(0);
+  uint num_head = q_.size(1);
+  uint qSize = q_.size(2);
+  uint headSize = q_.size(3);
+  uint maxSeqLength = k_.size(2);
+  uint N = k_.size(2);
+  uint B = q_.size(0) * q_.size(1);
+  uint k_head_stride = k_.stride(1);
+  uint k_seq_stride = k_.stride(2);
+  uint v_head_stride = v_.stride(1);
+  uint v_seq_stride = v_.stride(2);
+
+  auto out = at::empty({batchSize, num_head, qSize, headSize}, q_.options());
+  auto attn = at::empty({batchSize, num_head, qSize, maxSeqLength}, q_.options());
+  auto scale_factor = sdp::calculate_scale(q_, scale).expect_float();
+  MPSStream* mpsStream = getCurrentMPSStream();
+  bool use_rope = false;
+  float rope_angle = 10000.0f;
+ // Create RoPE params
+    struct {
+        float cos_angle;
+        float sin_angle;
+        int seq_len;
+        int use_rope;
+    } ropeParams;
+    
+    ropeParams.cos_angle = cos(1.0f / rope_angle);
+    ropeParams.sin_angle = sin(1.0f / rope_angle);
+    ropeParams.seq_len = std::max(qSize, maxSeqLength);
+    ropeParams.use_rope = use_rope ? 1 : 0;
+    
+    // Create sparse block info (for cross-attention we typically don't use causal masking)
+    struct {
+        int num_blocks;
+        int block_size;
+        int use_sparse;
+        int sparsity_pattern;
+    } sparseInfo;
+    
+    sparseInfo.num_blocks = (std::max(qSize, maxSeqLength) + 31) / 32;
+    sparseInfo.block_size = 32;
+    sparseInfo.use_sparse = 0;  // Use dense attention
+    sparseInfo.sparsity_pattern = 3; // Custom pattern (all allowed)
+    
+
+
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      auto computeEncoder = mpsStream->commandEncoder();
+      auto group_dims = MTLSizeMake(32, 1, 1);
+      int blocks_per_sequence = (qSize + 31) / 32;
+      int total_blocks = batchSize * num_head * blocks_per_sequence;  
+      auto grid_dims =MTLSizeMake(total_blocks, 1, 1);
+      bool has_mask = mask_.has_value();
+
+      const std::string kname =
+          "flash_attention_kernel";
+      auto attentionPSO = lib.getPipelineStateForFunc(kname);
+      [computeEncoder setComputePipelineState:attentionPSO];
+      mtl_setArgs(computeEncoder,
+                  q_,
+                  k_,
+                  v_,
+                  out,
+                  ropeParams,
+                  sparseInfo,
+                  batchSize,
+                  num_head,
+                  qSize,
+                  headSize
+                  );
+      [computeEncoder dispatchThreadgroups:grid_dims threadsPerThreadgroup:group_dims];
+    }
+  });
+  // reshape back to original dimension
+  auto final_out = unsqueezed ? out.view_as(orig_query) : out;
+  auto final_attn = unsqueezed ? (orig_query.dim() == 3 ? attn.squeeze(0) : [&]{
+    std::vector<int64_t> shape(orig_query.sizes().begin(), orig_query.sizes().end() - 3);
+    shape.insert(shape.end(), {attn.size(1), attn.size(2), attn.size(3)});
+    return attn.view(shape);
+  }()) : attn;
+
+  return {std::move(final_out), std::move(out)};
+}
+
 
 // Vector mode (One–pass variant)
 static std::tuple<Tensor, Tensor> sdpa_vector_fast_mps(const Tensor& q_,
@@ -414,6 +522,9 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math_mps(const Tensor& 
                                                                   bool is_causal,
                                                                   const std::optional<Tensor>& dropout_mask,
                                                                   std::optional<double> scale) {
+                                                                    
+ 
+std::cout << "scaled_dot_product_attention_mps" << std::endl; 
   auto query_tuple = ensure_4d(query);
   Tensor q_ = std::get<0>(query_tuple);
   bool unsqueezed = std::get<1>(query_tuple);
@@ -450,8 +561,12 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math_mps(const Tensor& 
   bool supports_fast_sdpa = !is_causal && supports_sdpa_vector;
 
   // if none of the fast paths apply, fall back to the generic mps graph solution
-  if (!supports_fast_sdpa) {
-    return sdpa_general_mps(q_, k_, v_, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
+  supports_fast_sdpa = false;
+  if (dropout_p >0) {
+      return sdpa_general_mps(q_, k_, v_, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
+  }else{
+        return flash_mps(q_, k_, v_, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
+
   }
 
   // dispatch to the fast SDPA implementation
