@@ -664,11 +664,11 @@ void apply_rope_impl(
             float2 pair = float2(static_cast<float>(vec[i]), static_cast<float>(vec[i+1]));
             
             // Calculate position-specific rotation
-            float freq = 1.0f / pow(10000.0f, float(i) / float(ActualHeadDim));
+            float freq = 1.0f / metal::fast::pow(10000.0f, float(i) / float(ActualHeadDim));
             float theta = pos * freq;
             
-            float cos_theta = cos(theta);
-            float sin_theta = sin(theta);
+            float cos_theta = metal::fast::cos(theta);
+            float sin_theta = metal::fast::sin(theta);
             
             // Apply rotation
             DTYPE x0_rot = static_cast<DTYPE>(pair[0] * cos_theta - pair[1] * sin_theta);
@@ -832,7 +832,7 @@ kernel void flash_attention_kernel_impl(
         }
 
         // Apply RoPE to query vector if enabled
-        apply_rope_impl<DTYPE, ActualHeadDim>(q_vec, q_thread_idx, rope_params, ActualHeadDim);
+        //apply_rope_impl<DTYPE, ActualHeadDim>(q_vec, q_thread_idx, rope_params, ActualHeadDim);
 
         // Store in shared memory
         for (int i = 0; i < ActualHeadDim; ++i) {
@@ -887,7 +887,7 @@ kernel void flash_attention_kernel_impl(
             }
 
             // Apply RoPE to key vector if enabled
-            apply_rope_impl<DTYPE, ActualHeadDim>(k_vec, k_thread_idx, rope_params, ActualHeadDim);
+            //apply_rope_impl<DTYPE, ActualHeadDim>(k_vec, k_thread_idx, rope_params, ActualHeadDim);
 
             // Store in shared memory
             for (int i = 0; i < ActualHeadDim; ++i) {
@@ -939,7 +939,7 @@ kernel void flash_attention_kernel_impl(
                 // Apply softmax normalization - optimized numerical stability method
                 if (score > max_score) {
                     // When we find a new maximum, rescale previous contributions
-                    const float scale = exp(max_score - score);
+                    const float scale = metal::fast::exp(max_score - score);
                     sum_exp *= scale;
                     for (int i = 0; i < ActualHeadDim; i += 4) {
                         float4 scaled_accum;
@@ -956,7 +956,7 @@ kernel void flash_attention_kernel_impl(
                     max_score = score;
                 }
 
-                const float exp_score = exp(score - max_score);
+                const float exp_score = metal::fast::exp(score - max_score);
                 sum_exp += exp_score;
 
                 // Update output with weighted value - vectorized
@@ -1025,23 +1025,26 @@ kernel void flash_attention_kernel_impl(
 // Instantiate for common float cases that fit within 32KB threadgroup memory
 // For float (4 bytes/element): ActualBlockSize * ActualHeadDim * 3 * 4 <= 32768
 // => ActualBlockSize * ActualHeadDim <= 2730
-INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 16);   // Shared mem: 16*16*3*4 = 3072 bytes (3KB). OK.
-INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 32);   // Shared mem: 16*32*3*4 = 6144 bytes (6KB). OK.
-INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 64);   // Shared mem: 16*64*3*4 = 12288 bytes (12KB). OK.
-INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 128);  // Shared mem: 16*128*3*4 = 24576 bytes (24KB). OK.
-INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 16);   // Shared mem: 32*32*3*4 = 12288 bytes (12KB). OK.
-INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 32);   // Shared mem: 32*32*3*4 = 12288 bytes (12KB). OK.
-INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 64);   // Shared mem: 32*64*3*4 = 24576 bytes (24KB). OK.
-INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 80);   // Shared mem: 32*80*3*4 = 30720 bytes (30KB). OK.
-INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 128);   // Shared mem: 32*32*3*4 = 12288 bytes (12KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 16);   // Shared mem: 16*16*3*4   = 3072 bytes (3KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 32);   // Shared mem: 16*32*3*4   = 6144 bytes (6KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 64);   // Shared mem: 16*64*3*4   = 12288 bytes (12KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 128);  // Shared mem: 16*128*3*4  = 24576 bytes (24KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 16);   // Shared mem: 32*16*3*4   = 6144 bytes (6KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 32);   // Shared mem: 32*32*3*4   = 12288 bytes (12KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 64);   // Shared mem: 32*64*3*4   = 24576 bytes (24KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 80);   // Shared mem: 32*80*3*4   = 30720 bytes (30KB). OK.
+// INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 128);  // Shared mem: 32*128*3*4 = 49152 bytes (48KB). EXCEEDS 32KB LIMIT.
 
 
 // Instantiate for common half cases
 // For half (2 bytes/element): ActualBlockSize * ActualHeadDim * 3 * 2 <= 32768
 // => ActualBlockSize * ActualHeadDim <= 5461
-INSTANTIATE_FLASH_ATTENTION_KERNEL(half, 16, 16); // 16*16 = 256kB 
-INSTANTIATE_FLASH_ATTENTION_KERNEL(half, 16, 32); // 32*128 = 4096. OK. (24KB)
-INSTANTIATE_FLASH_ATTENTION_KERNEL(half, 32, 64);  // 32*64 = 2048. OK. (12KB)
-INSTANTIATE_FLASH_ATTENTION_KERNEL(half, 32, 128); // 32*128 = 4096. OK. (24KB)
+INSTANTIATE_FLASH_ATTENTION_KERNEL(half, 16, 16);    // Shared mem: 16*16*3*2   = 1536 bytes (1.5KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(half, 16, 32);    // Shared mem: 16*32*3*2   = 3072 bytes (3KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(half, 16, 64);    // Shared mem: 16*64*3*2   = 6144 bytes (6KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(half, 16, 128);   // Shared mem: 16*128*3*2  = 12288 bytes (12KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(half, 32, 64);    // Shared mem: 32*64*3*2   = 12288 bytes (12KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(half, 32, 128);   // Shared mem: 32*128*3*2  = 24576 bytes (24KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(half, 32, 160);   // Shared mem: 32*160*3*2  = 30720 bytes (30KB). OK.
 
 // Add more instantiations as needed based on typical head dimensions and block sizes

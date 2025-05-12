@@ -174,7 +174,7 @@ static std::tuple<Tensor, Tensor> flash_mps(const Tensor& q_,
   uint headSize = q_.size(3);
   uint maxSeqLength = k_.size(2);
   // This is the block size used for kernel specialization and launch.
-  const int KERNEL_ACTUAL_BLOCK_SIZE = 16; // Or 32. Ensure this matches an instantiated kernel variant.
+  const int KERNEL_ACTUAL_BLOCK_SIZE = 32; // Or 32. Ensure this matches an instantiated kernel variant.
   uint N = k_.size(2);
   uint B = q_.size(0) * q_.size(1);
   uint k_head_stride = k_.stride(1);
