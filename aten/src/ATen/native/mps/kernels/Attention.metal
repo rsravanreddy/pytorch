@@ -626,13 +626,9 @@ INSTANTIATE_ATTN_SHAPES_HELPER(bfloat);
 #endif
 
 
-
 // Constants for Flash Attention
-constant int BLOCK_SIZE =32;     // Increased block size from 32 to 64 for better memory efficiency
-// Remove the hard-coded HEAD_SIZE constant and use the parameter passed from C++
-// constant int HEAD_SIZE = 64;   // Size of attention heads
+// BLOCK_SIZE and HEAD_DIM will now be template parameters
 constant int WARP_SIZE = 32;      // Warp size for Metal execution
-constant int MAX_HEAD_DIM = 128;  // Maximum head dimension supported (for threadgroup memory allocation)
 constant float ATTN_MASK_VALUE = -10000.0f;  // Mask value for masked attention
 
 // RoPE (Rotary Position Embeddings) implementation
@@ -652,30 +648,31 @@ struct SparseBlockInfo {
 };
 
 // Helper function to apply RoPE to vectors
-void apply_rope(
-    thread float* vec, 
+template <typename DTYPE, int ActualHeadDim>
+void apply_rope_impl(
+    thread DTYPE* vec,
     const int pos, 
     const RoPEParams rope_params, 
-    const int head_dim
+    const int rope_head_dim_runtime_check // This is ActualHeadDim, passed for consistency
 ) {
     if (rope_params.use_rope == 0) return;
     
     // Apply RoPE rotation to pairs of elements in the vector
     #pragma unroll 4
-    for (int i = 0; i < head_dim; i += 2) {
-        if (i + 1 < head_dim) {  // Ensure we have a pair
-            float2 pair = float2(vec[i], vec[i+1]);
+    for (int i = 0; i < ActualHeadDim; i += 2) {
+        if (i + 1 < ActualHeadDim) {  // Ensure we have a pair
+            float2 pair = float2(static_cast<float>(vec[i]), static_cast<float>(vec[i+1]));
             
             // Calculate position-specific rotation
-            float freq = 1.0f / pow(10000.0f, float(i) / float(head_dim));
+            float freq = 1.0f / pow(10000.0f, float(i) / float(ActualHeadDim));
             float theta = pos * freq;
             
             float cos_theta = cos(theta);
             float sin_theta = sin(theta);
             
             // Apply rotation
-            float x0_rot = pair[0] * cos_theta - pair[1] * sin_theta;
-            float x1_rot = pair[0] * sin_theta + pair[1] * cos_theta;
+            DTYPE x0_rot = static_cast<DTYPE>(pair[0] * cos_theta - pair[1] * sin_theta);
+            DTYPE x1_rot = static_cast<DTYPE>(pair[0] * sin_theta + pair[1] * cos_theta);
             
             vec[i] = x0_rot;
             vec[i+1] = x1_rot;
@@ -684,30 +681,31 @@ void apply_rope(
 }
 
 // Compute attention score using SIMD operations for better performance
-float compute_attention_score(thread float* query, threadgroup float* key, int head_dim, float scale_factor) {
+template <typename DTYPE, int ActualHeadDim>
+float compute_attention_score_impl(thread DTYPE* query, threadgroup DTYPE* key, float scale_factor) {
     float score = 0.0f;
     
     // Process in chunks of 4 for better vectorization
-    for (int i = 0; i < head_dim; i += 4) {
+    for (int i = 0; i < ActualHeadDim; i += 4) {
         float4 q_chunk, k_chunk;
         
         // Load query chunks
-        q_chunk.x = query[i];
-        if (i + 1 < head_dim) q_chunk.y = query[i + 1];
-        if (i + 2 < head_dim) q_chunk.z = query[i + 2];
-        if (i + 3 < head_dim) q_chunk.w = query[i + 3];
+        q_chunk.x = static_cast<float>(query[i]);
+        if (i + 1 < ActualHeadDim) q_chunk.y = static_cast<float>(query[i + 1]);
+        if (i + 2 < ActualHeadDim) q_chunk.z = static_cast<float>(query[i + 2]);
+        if (i + 3 < ActualHeadDim) q_chunk.w = static_cast<float>(query[i + 3]);
         
         // Load key chunks
-        k_chunk.x = key[i];
-        if (i + 1 < head_dim) k_chunk.y = key[i + 1];
-        if (i + 2 < head_dim) k_chunk.z = key[i + 2];
-        if (i + 3 < head_dim) k_chunk.w = key[i + 3];
+        k_chunk.x = static_cast<float>(key[i]);
+        if (i + 1 < ActualHeadDim) k_chunk.y = static_cast<float>(key[i + 1]);
+        if (i + 2 < ActualHeadDim) k_chunk.z = static_cast<float>(key[i + 2]);
+        if (i + 3 < ActualHeadDim) k_chunk.w = static_cast<float>(key[i + 3]);
         
         // Dot product calculation using SIMD operations
         score += q_chunk.x * k_chunk.x;
-        if (i + 1 < head_dim) score += q_chunk.y * k_chunk.y;
-        if (i + 2 < head_dim) score += q_chunk.z * k_chunk.z;
-        if (i + 3 < head_dim) score += q_chunk.w * k_chunk.w;
+        if (i + 1 < ActualHeadDim) score += q_chunk.y * k_chunk.y;
+        if (i + 2 < ActualHeadDim) score += q_chunk.z * k_chunk.z;
+        if (i + 3 < ActualHeadDim) score += q_chunk.w * k_chunk.w;
     }
     
     // Apply scaling factor
@@ -749,72 +747,77 @@ bool is_block_in_mask(
     }
 }
 
-kernel void flash_attention_kernel(
-    device const float* query [[buffer(0)]],
-    device const float* key [[buffer(1)]],
-    device const float* value [[buffer(2)]],
-    device float* output [[buffer(3)]],
+template <typename DTYPE, int ActualBlockSize, int ActualHeadDim>
+kernel void flash_attention_kernel_impl(
+    device const DTYPE* query_ptr [[buffer(0)]],
+    device const DTYPE* key_ptr [[buffer(1)]],
+    device const DTYPE* value_ptr [[buffer(2)]],
+    device DTYPE* output_ptr [[buffer(3)]],
     constant RoPEParams& rope_params [[buffer(4)]],
     constant SparseBlockInfo& sparse_info [[buffer(5)]],
     constant int& batch_size [[buffer(6)]],
     constant int& num_heads [[buffer(7)]],
     constant int& seq_len [[buffer(8)]],
-    constant int& head_dim [[buffer(9)]],
+    // head_dim is now ActualHeadDim from template
+    // constant int& head_dim_runtime [[buffer(9)]], // Removed, use ActualHeadDim
     uint tid [[thread_index_in_threadgroup]],
     uint bid [[threadgroup_position_in_grid]],
-    uint block_dim [[threads_per_threadgroup]])
+    uint threads_in_group [[threads_per_threadgroup]])
 {
+    // Ensure the launched threadgroup size matches our template ActualBlockSize
+    // metal_assert(threads_in_group == ActualBlockSize);
+
     // Calculate scale factor inside the kernel function
-    const float scale_factor = 1.0f / sqrt(float(head_dim));
+    const float scale_factor = 1.0f / sqrt(float(ActualHeadDim));
 
     // Decode 3D grid index (batch_idx, head_idx, q_block_idx)
-    const int num_q_blocks = (seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int num_q_blocks = (seq_len + ActualBlockSize - 1) / ActualBlockSize;
     const int blocks_per_batch_head = num_q_blocks;
-    
+
     const int batch_head_idx = bid / blocks_per_batch_head;
     const int q_block_idx = bid % blocks_per_batch_head;
-    
+
     const int batch_idx = batch_head_idx / num_heads;
     const int head_idx = batch_head_idx % num_heads;
-    
+
     // Get the starting position in the sequence for this query block
-    const int q_start_idx = q_block_idx * BLOCK_SIZE;
-    
+    const int q_start_idx = q_block_idx * ActualBlockSize;
+
     // Get thread's position within the block
     const int q_thread_idx = q_start_idx + tid;
     const bool valid_q_thread = q_thread_idx < seq_len;
-    
+
     // Shared memory for blocks
-    threadgroup float s_query[BLOCK_SIZE][MAX_HEAD_DIM];
-    threadgroup float s_key[BLOCK_SIZE][MAX_HEAD_DIM];
-    threadgroup float s_value[BLOCK_SIZE][MAX_HEAD_DIM];
-    
+    threadgroup DTYPE s_query[ActualBlockSize][ActualHeadDim];
+    threadgroup DTYPE s_key[ActualBlockSize][ActualHeadDim];
+    threadgroup DTYPE s_value[ActualBlockSize][ActualHeadDim];
+
     // Each thread loads and processes one query position
-    thread float q_vec[MAX_HEAD_DIM];
-    thread float accum[MAX_HEAD_DIM];
-    
+    thread DTYPE q_vec[ActualHeadDim];
+    thread DTYPE accum[ActualHeadDim];
+
     // Initialize output accumulator
-    for (int i = 0; i < head_dim; ++i) {
+    for (int i = 0; i < ActualHeadDim; ++i) {
         accum[i] = 0.0f;
     }
-    
+
     float max_score = -INFINITY;
     float sum_exp = 0.0f;
-    
+
     // Only process if this thread maps to a valid sequence position
     if (valid_q_thread) {
         // Load query vector for this position
-        const int q_offset = ((batch_idx * num_heads + head_idx) * seq_len + q_thread_idx) * head_dim;
-        
+        const int q_offset = ((batch_idx * num_heads + head_idx) * seq_len + q_thread_idx) * ActualHeadDim;
+
         // Vectorized loading of query data
-        for (int i = 0; i < head_dim; i += 4) {
+        for (int i = 0; i < ActualHeadDim; i += 4) {
             float4 chunk;
-            if (i + 3 < head_dim) {
+            if (i + 3 < ActualHeadDim) {
                 chunk = float4(
-                    query[q_offset + i],
-                    query[q_offset + i + 1],
-                    query[q_offset + i + 2],
-                    query[q_offset + i + 3]
+                    query_ptr[q_offset + i],
+                    query_ptr[q_offset + i + 1],
+                    query_ptr[q_offset + i + 2],
+                    query_ptr[q_offset + i + 3]
                 );
                 q_vec[i] = chunk.x;
                 q_vec[i+1] = chunk.y;
@@ -822,54 +825,54 @@ kernel void flash_attention_kernel(
                 q_vec[i+3] = chunk.w;
             } else {
                 // Handle the tail case where we can't load all 4 elements
-                q_vec[i] = query[q_offset + i];
-                if (i + 1 < head_dim) q_vec[i + 1] = query[q_offset + i + 1];
-                if (i + 2 < head_dim) q_vec[i + 2] = query[q_offset + i + 2];
+                q_vec[i] = query_ptr[q_offset + i];
+                if (i + 1 < ActualHeadDim) q_vec[i + 1] = query_ptr[q_offset + i + 1];
+                if (i + 2 < ActualHeadDim) q_vec[i + 2] = query_ptr[q_offset + i + 2];
             }
         }
-        
+
         // Apply RoPE to query vector if enabled
-        apply_rope(q_vec, q_thread_idx, rope_params, head_dim);
-        
+        apply_rope_impl<DTYPE, ActualHeadDim>(q_vec, q_thread_idx, rope_params, ActualHeadDim);
+
         // Store in shared memory
-        for (int i = 0; i < head_dim; ++i) {
+        for (int i = 0; i < ActualHeadDim; ++i) {
             s_query[tid][i] = q_vec[i];
         }
     }
-    
+
     // Wait for all threads to finish loading query data
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     // Process all key blocks
-    const int num_k_blocks = (seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    
+    const int num_k_blocks = (seq_len + ActualBlockSize - 1) / ActualBlockSize;
+
     for (int k_block_idx = 0; k_block_idx < num_k_blocks; ++k_block_idx) {
         // Skip this block if it's not in the sparse mask
         if (!is_block_in_mask(q_block_idx, k_block_idx, sparse_info)) {
             continue;
         }
-        
+
         // Calculate starting position for this key block
-        const int k_start_idx = k_block_idx * BLOCK_SIZE;
-        
+        const int k_start_idx = k_block_idx * ActualBlockSize;
+
         // Collaboratively load key and value blocks into shared memory
         const int k_thread_idx = k_start_idx + tid;
         const bool valid_k_thread = k_thread_idx < seq_len;
-        
+
         if (valid_k_thread) {
             // Load key and value for this position
-            const int kv_offset = ((batch_idx * num_heads + head_idx) * seq_len + k_thread_idx) * head_dim;
-            
+            const int kv_offset = ((batch_idx * num_heads + head_idx) * seq_len + k_thread_idx) * ActualHeadDim;
+
             // Load key into shared memory - vectorized
-            thread float k_vec[MAX_HEAD_DIM];
-            for (int i = 0; i < head_dim; i += 4) {
+            thread DTYPE k_vec[ActualHeadDim]; // This is a per-thread temporary for loading
+            for (int i = 0; i < ActualHeadDim; i += 4) {
                 float4 chunk;
-                if (i + 3 < head_dim) {
+                if (i + 3 < ActualHeadDim) {
                     chunk = float4(
-                        key[kv_offset + i],
-                        key[kv_offset + i + 1],
-                        key[kv_offset + i + 2],
-                        key[kv_offset + i + 3]
+                        key_ptr[kv_offset + i],
+                        key_ptr[kv_offset + i + 1],
+                        key_ptr[kv_offset + i + 2],
+                        key_ptr[kv_offset + i + 3]
                     );
                     k_vec[i] = chunk.x;
                     k_vec[i+1] = chunk.y;
@@ -877,29 +880,29 @@ kernel void flash_attention_kernel(
                     k_vec[i+3] = chunk.w;
                 } else {
                     // Handle the tail case
-                    k_vec[i] = key[kv_offset + i];
-                    if (i + 1 < head_dim) k_vec[i + 1] = key[kv_offset + i + 1];
-                    if (i + 2 < head_dim) k_vec[i + 2] = key[kv_offset + i + 2];
+                    k_vec[i] = key_ptr[kv_offset + i];
+                    if (i + 1 < ActualHeadDim) k_vec[i + 1] = key_ptr[kv_offset + i + 1];
+                    if (i + 2 < ActualHeadDim) k_vec[i + 2] = key_ptr[kv_offset + i + 2];
                 }
             }
-            
+
             // Apply RoPE to key vector if enabled
-            apply_rope(k_vec, k_thread_idx, rope_params, head_dim);
-            
+            apply_rope_impl<DTYPE, ActualHeadDim>(k_vec, k_thread_idx, rope_params, ActualHeadDim);
+
             // Store in shared memory
-            for (int i = 0; i < head_dim; ++i) {
+            for (int i = 0; i < ActualHeadDim; ++i) {
                 s_key[tid][i] = k_vec[i];
             }
-            
+
             // Load value into shared memory - vectorized
-            for (int i = 0; i < head_dim; i += 4) {
+            for (int i = 0; i < ActualHeadDim; i += 4) {
                 float4 chunk;
-                if (i + 3 < head_dim) {
+                if (i + 3 < ActualHeadDim) {
                     chunk = float4(
-                        value[kv_offset + i],
-                        value[kv_offset + i + 1],
-                        value[kv_offset + i + 2],
-                        value[kv_offset + i + 3]
+                        value_ptr[kv_offset + i],
+                        value_ptr[kv_offset + i + 1],
+                        value_ptr[kv_offset + i + 2],
+                        value_ptr[kv_offset + i + 3]
                     );
                     s_value[tid][i] = chunk.x;
                     s_value[tid][i+1] = chunk.y;
@@ -907,23 +910,23 @@ kernel void flash_attention_kernel(
                     s_value[tid][i+3] = chunk.w;
                 } else {
                     // Handle the tail case
-                    s_value[tid][i] = value[kv_offset + i];
-                    if (i + 1 < head_dim) s_value[tid][i + 1] = value[kv_offset + i + 1];
-                    if (i + 2 < head_dim) s_value[tid][i + 2] = value[kv_offset + i + 2];
+                    s_value[tid][i] = value_ptr[kv_offset + i];
+                    if (i + 1 < ActualHeadDim) s_value[tid][i + 1] = value_ptr[kv_offset + i + 1];
+                    if (i + 2 < ActualHeadDim) s_value[tid][i + 2] = value_ptr[kv_offset + i + 2];
                 }
             }
         }
-        
+
         // Wait for all threads to finish loading key/value data
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        
+
         // Process attention for this query against all keys in this block
         if (valid_q_thread) {
-            const int k_block_limit = min(BLOCK_SIZE, seq_len - k_start_idx);
-            
+            const int k_block_limit = min(ActualBlockSize, seq_len - k_start_idx);
+
             for (int k_idx = 0; k_idx < k_block_limit; ++k_idx) {
                 const int abs_k_idx = k_start_idx + k_idx;
-                
+
                 // Causal masking for self-attention
                 // In self-attention, the query should not attend to future positions
                 if (q_thread_idx < abs_k_idx) {
@@ -931,44 +934,44 @@ kernel void flash_attention_kernel(
                 }
                 
                 // Compute attention score
-                float score = compute_attention_score(q_vec, s_key[k_idx], head_dim, scale_factor);
+                float score = compute_attention_score_impl<DTYPE, ActualHeadDim>(q_vec, s_key[k_idx], scale_factor);
 
                 // Apply softmax normalization - optimized numerical stability method
                 if (score > max_score) {
                     // When we find a new maximum, rescale previous contributions
                     const float scale = exp(max_score - score);
                     sum_exp *= scale;
-                    for (int i = 0; i < head_dim; i += 4) {
+                    for (int i = 0; i < ActualHeadDim; i += 4) {
                         float4 scaled_accum;
                         scaled_accum.x = accum[i] * scale;
-                        if (i + 1 < head_dim) scaled_accum.y = accum[i+1] * scale;
-                        if (i + 2 < head_dim) scaled_accum.z = accum[i+2] * scale;
-                        if (i + 3 < head_dim) scaled_accum.w = accum[i+3] * scale;
-                        
+                        if (i + 1 < ActualHeadDim) scaled_accum.y = accum[i+1] * scale;
+                        if (i + 2 < ActualHeadDim) scaled_accum.z = accum[i+2] * scale;
+                        if (i + 3 < ActualHeadDim) scaled_accum.w = accum[i+3] * scale;
+
                         accum[i] = scaled_accum.x;
-                        if (i + 1 < head_dim) accum[i+1] = scaled_accum.y;
-                        if (i + 2 < head_dim) accum[i+2] = scaled_accum.z;
-                        if (i + 3 < head_dim) accum[i+3] = scaled_accum.w;
+                        if (i + 1 < ActualHeadDim) accum[i+1] = scaled_accum.y;
+                        if (i + 2 < ActualHeadDim) accum[i+2] = scaled_accum.z;
+                        if (i + 3 < ActualHeadDim) accum[i+3] = scaled_accum.w;
                     }
                     max_score = score;
                 }
-                
+
                 const float exp_score = exp(score - max_score);
                 sum_exp += exp_score;
 
                 // Update output with weighted value - vectorized
                 #pragma unroll 4
-                for (int i = 0; i < head_dim; i += 4) {
+                for (int i = 0; i < ActualHeadDim; i += 4) {
                     float4 value_chunk;
                     value_chunk.x = s_value[k_idx][i];
-                    if (i + 1 < head_dim) value_chunk.y = s_value[k_idx][i+1];
-                    if (i + 2 < head_dim) value_chunk.z = s_value[k_idx][i+2];
-                    if (i + 3 < head_dim) value_chunk.w = s_value[k_idx][i+3];
-                    
+                    if (i + 1 < ActualHeadDim) value_chunk.y = s_value[k_idx][i+1];
+                    if (i + 2 < ActualHeadDim) value_chunk.z = s_value[k_idx][i+2];
+                    if (i + 3 < ActualHeadDim) value_chunk.w = s_value[k_idx][i+3];
+
                     accum[i] += exp_score * value_chunk.x;
-                    if (i + 1 < head_dim) accum[i+1] += exp_score * value_chunk.y;
-                    if (i + 2 < head_dim) accum[i+2] += exp_score * value_chunk.z;
-                    if (i + 3 < head_dim) accum[i+3] += exp_score * value_chunk.w;
+                    if (i + 1 < ActualHeadDim) accum[i+1] += exp_score * value_chunk.y;
+                    if (i + 2 < ActualHeadDim) accum[i+2] += exp_score * value_chunk.z;
+                    if (i + 3 < ActualHeadDim) accum[i+3] += exp_score * value_chunk.w;
                 }
             }
         }
@@ -976,28 +979,69 @@ kernel void flash_attention_kernel(
         // Wait for all threads to finish processing this block
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    
+
     // Write normalized output to global memory
     if (valid_q_thread) {
-        const int out_offset = ((batch_idx * num_heads + head_idx) * seq_len + q_thread_idx) * head_dim;
-        
+        const int out_offset = ((batch_idx * num_heads + head_idx) * seq_len + q_thread_idx) * ActualHeadDim;
+
         // Add epsilon to avoid division by zero
         const float epsilon = 1e-6f;
         const float inv_sum = 1.0f / (sum_exp + epsilon);
-        
+
         // Write the normalized weighted values to output - vectorized
-        for (int i = 0; i < head_dim; i += 4) {
+        for (int i = 0; i < ActualHeadDim; i += 4) {
             float4 out_chunk;
             out_chunk.x = accum[i] * inv_sum;
-            
-            if (i + 1 < head_dim) out_chunk.y = accum[i+1] * inv_sum;
-            if (i + 2 < head_dim) out_chunk.z = accum[i+2] * inv_sum;
-            if (i + 3 < head_dim) out_chunk.w = accum[i+3] * inv_sum;
-            
-            output[out_offset + i] = out_chunk.x;
-            if (i + 1 < head_dim) output[out_offset + i + 1] = out_chunk.y;
-            if (i + 2 < head_dim) output[out_offset + i + 2] = out_chunk.z;
-            if (i + 3 < head_dim) output[out_offset + i + 3] = out_chunk.w;
+
+            if (i + 1 < ActualHeadDim) out_chunk.y = accum[i+1] * inv_sum;
+            if (i + 2 < ActualHeadDim) out_chunk.z = accum[i+2] * inv_sum;
+            if (i + 3 < ActualHeadDim) out_chunk.w = accum[i+3] * inv_sum;
+
+            output_ptr[out_offset + i] = out_chunk.x;
+            if (i + 1 < ActualHeadDim) output_ptr[out_offset + i + 1] = out_chunk.y;
+            if (i + 2 < ActualHeadDim) output_ptr[out_offset + i + 2] = out_chunk.z;
+            if (i + 3 < ActualHeadDim) output_ptr[out_offset + i + 3] = out_chunk.w;
         }
     }
 }
+
+// Instantiation macros for flash_attention_kernel_impl
+#define INSTANTIATE_FLASH_ATTENTION_KERNEL(DTYPE, ACTUAL_BLOCK_SIZE, ACTUAL_HEAD_DIM) \
+  template [[host_name("flash_attention_kernel_" #DTYPE "_bs" #ACTUAL_BLOCK_SIZE "_hd" #ACTUAL_HEAD_DIM)]] \
+  [[kernel]] void flash_attention_kernel_impl<DTYPE, ACTUAL_BLOCK_SIZE, ACTUAL_HEAD_DIM>( \
+      device const DTYPE* query_ptr [[buffer(0)]], \
+      device const DTYPE* key_ptr [[buffer(1)]], \
+      device const DTYPE* value_ptr [[buffer(2)]], \
+      device DTYPE* output_ptr [[buffer(3)]], \
+      constant RoPEParams& rope_params [[buffer(4)]], \
+      constant SparseBlockInfo& sparse_info [[buffer(5)]], \
+      constant int& batch_size [[buffer(6)]], \
+      constant int& num_heads [[buffer(7)]], \
+      constant int& seq_len [[buffer(8)]], \
+      uint tid [[thread_index_in_threadgroup]], \
+      uint bid [[threadgroup_position_in_grid]], \
+      uint threads_in_group [[threads_per_threadgroup]]);
+
+// Instantiate for common float cases that fit within 32KB threadgroup memory
+// For float (4 bytes/element): ActualBlockSize * ActualHeadDim * 3 * 4 <= 32768
+// => ActualBlockSize * ActualHeadDim <= 2730
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 16);   // Shared mem: 16*16*3*4 = 3072 bytes (3KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 32);   // Shared mem: 16*32*3*4 = 6144 bytes (6KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 64);   // Shared mem: 16*64*3*4 = 12288 bytes (12KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 128);  // Shared mem: 16*128*3*4 = 24576 bytes (24KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 16);   // Shared mem: 32*32*3*4 = 12288 bytes (12KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 32);   // Shared mem: 32*32*3*4 = 12288 bytes (12KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 64);   // Shared mem: 32*64*3*4 = 24576 bytes (24KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 80);   // Shared mem: 32*80*3*4 = 30720 bytes (30KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 128);   // Shared mem: 32*32*3*4 = 12288 bytes (12KB). OK.
+
+
+// Instantiate for common half cases
+// For half (2 bytes/element): ActualBlockSize * ActualHeadDim * 3 * 2 <= 32768
+// => ActualBlockSize * ActualHeadDim <= 5461
+INSTANTIATE_FLASH_ATTENTION_KERNEL(half, 16, 16); // 16*16 = 256kB 
+INSTANTIATE_FLASH_ATTENTION_KERNEL(half, 16, 32); // 32*128 = 4096. OK. (24KB)
+INSTANTIATE_FLASH_ATTENTION_KERNEL(half, 32, 64);  // 32*64 = 2048. OK. (12KB)
+INSTANTIATE_FLASH_ATTENTION_KERNEL(half, 32, 128); // 32*128 = 4096. OK. (24KB)
+
+// Add more instantiations as needed based on typical head dimensions and block sizes

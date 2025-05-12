@@ -167,14 +167,14 @@ static std::tuple<Tensor, Tensor> flash_mps(const Tensor& q_,
   // constant int& seq_len [[buffer(8)]],
   // constant int& head_dim [[buffer(9)]],
   // (batch_size, seq_len, num_heads, head_dim)
-
-  std::cout << "flash_mps" << std::endl;
   using namespace mps;
   uint batchSize = q_.size(0);
   uint num_head = q_.size(1);
   uint qSize = q_.size(2);
   uint headSize = q_.size(3);
   uint maxSeqLength = k_.size(2);
+  // This is the block size used for kernel specialization and launch.
+  const int KERNEL_ACTUAL_BLOCK_SIZE = 16; // Or 32. Ensure this matches an instantiated kernel variant.
   uint N = k_.size(2);
   uint B = q_.size(0) * q_.size(1);
   uint k_head_stride = k_.stride(1);
@@ -209,26 +209,30 @@ static std::tuple<Tensor, Tensor> flash_mps(const Tensor& q_,
         int sparsity_pattern;
     } sparseInfo;
     
-    sparseInfo.num_blocks = (std::max(qSize, maxSeqLength) + 31) / 32;
-    sparseInfo.block_size = 32;
+    sparseInfo.block_size = KERNEL_ACTUAL_BLOCK_SIZE;
+    sparseInfo.num_blocks = (std::max(qSize, maxSeqLength) + KERNEL_ACTUAL_BLOCK_SIZE - 1) / KERNEL_ACTUAL_BLOCK_SIZE;
     sparseInfo.use_sparse = 0;  // Use dense attention
     sparseInfo.sparsity_pattern = 3; // Custom pattern (all allowed)
     
-
-
   dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
     @autoreleasepool {
       auto computeEncoder = mpsStream->commandEncoder();
-      auto group_dims = MTLSizeMake(32, 1, 1);
-      int blocks_per_sequence = (qSize + 31) / 32;
+      // Ensure threadsPerThreadgroup matches the ActualBlockSize of the kernel
+      auto group_dims = MTLSizeMake(KERNEL_ACTUAL_BLOCK_SIZE, 1, 1);
+      int blocks_per_sequence = (qSize + KERNEL_ACTUAL_BLOCK_SIZE - 1) / KERNEL_ACTUAL_BLOCK_SIZE;
       int total_blocks = batchSize * num_head * blocks_per_sequence;  
       auto grid_dims =MTLSizeMake(total_blocks, 1, 1);
       bool has_mask = mask_.has_value();
 
+      // Construct kernel name based on DTYPE, ActualBlockSize, and ActualHeadDim
       const std::string kname =
-          "flash_attention_kernel";
+          fmt::format("flash_attention_kernel_{}_bs{}_hd{}",
+                      scalarToMetalTypeString(q_),
+                      KERNEL_ACTUAL_BLOCK_SIZE,
+                      headSize);
       auto attentionPSO = lib.getPipelineStateForFunc(kname);
       [computeEncoder setComputePipelineState:attentionPSO];
+      // headSize is no longer passed as a runtime argument to the kernel
       mtl_setArgs(computeEncoder,
                   q_,
                   k_,
@@ -238,8 +242,7 @@ static std::tuple<Tensor, Tensor> flash_mps(const Tensor& q_,
                   sparseInfo,
                   batchSize,
                   num_head,
-                  qSize,
-                  headSize
+                  qSize // This corresponds to seq_len in the kernel (buffer 8)
                   );
       [computeEncoder dispatchThreadgroups:grid_dims threadsPerThreadgroup:group_dims];
     }
@@ -251,8 +254,9 @@ static std::tuple<Tensor, Tensor> flash_mps(const Tensor& q_,
     shape.insert(shape.end(), {attn.size(1), attn.size(2), attn.size(3)});
     return attn.view(shape);
   }()) : attn;
-
-  return {std::move(final_out), std::move(out)};
+  // The second element of the tuple should be the attention weights, not the output again.
+  // For flash_mps, if `attn` is not populated by the kernel, this will be an empty/zero tensor.
+  return {std::move(final_out), std::move(final_attn)};
 }
 
 
@@ -562,7 +566,7 @@ std::cout << "scaled_dot_product_attention_mps" << std::endl;
 
   // if none of the fast paths apply, fall back to the generic mps graph solution
   supports_fast_sdpa = false;
-  if (dropout_p >0) {
+  if (dropout_p > 0) {
       return sdpa_general_mps(q_, k_, v_, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
   }else{
         return flash_mps(q_, k_, v_, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
