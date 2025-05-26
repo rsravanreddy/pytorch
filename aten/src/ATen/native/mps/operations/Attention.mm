@@ -181,7 +181,7 @@ static std::tuple<Tensor, Tensor> flash_mps(const Tensor& q_,
   uint k_seq_stride = k_.stride(2);
   uint v_head_stride = v_.stride(1);
   uint v_seq_stride = v_.stride(2);
-
+  std::cout << "flash_mps" << std::endl;
   auto out = at::empty({batchSize, num_head, qSize, headSize}, q_.options());
   auto attn = at::empty({batchSize, num_head, qSize, maxSeqLength}, q_.options());
   auto scale_factor = sdp::calculate_scale(q_, scale).expect_float();
@@ -565,11 +565,11 @@ std::cout << "scaled_dot_product_attention_mps" << std::endl;
   bool supports_fast_sdpa = !is_causal && supports_sdpa_vector;
 
   // if none of the fast paths apply, fall back to the generic mps graph solution
-  supports_fast_sdpa = false;
   if (dropout_p > 0) {
-      return sdpa_general_mps(q_, k_, v_, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
+    std::cout << "dropout_p > 0" << std::endl;
+      dropout_p = 0.0;
   }else{
-        return flash_mps(q_, k_, v_, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
+      return flash_mps(q_, k_, v_, mask_, 0.0, is_causal, dropout_mask, scale, query, unsqueezed);
 
   }
 

@@ -630,6 +630,8 @@ INSTANTIATE_ATTN_SHAPES_HELPER(bfloat);
 // BLOCK_SIZE and HEAD_DIM will now be template parameters
 constant int WARP_SIZE = 32;      // Warp size for Metal execution
 constant float ATTN_MASK_VALUE = -10000.0f;  // Mask value for masked attention
+constant int TILE_SIZE_Q = 128;    // Size of query tiles for tiled processing
+constant int TILE_SIZE_K = 128;    // Size of key/value tiles for tiled processing
 
 // RoPE (Rotary Position Embeddings) implementation
 struct RoPEParams {
@@ -758,15 +760,10 @@ kernel void flash_attention_kernel_impl(
     constant int& batch_size [[buffer(6)]],
     constant int& num_heads [[buffer(7)]],
     constant int& seq_len [[buffer(8)]],
-    // head_dim is now ActualHeadDim from template
-    // constant int& head_dim_runtime [[buffer(9)]], // Removed, use ActualHeadDim
     uint tid [[thread_index_in_threadgroup]],
     uint bid [[threadgroup_position_in_grid]],
     uint threads_in_group [[threads_per_threadgroup]])
 {
-    // Ensure the launched threadgroup size matches our template ActualBlockSize
-    // metal_assert(threads_in_group == ActualBlockSize);
-
     // Calculate scale factor inside the kernel function
     const float scale_factor = 1.0f / sqrt(float(ActualHeadDim));
 
@@ -787,7 +784,7 @@ kernel void flash_attention_kernel_impl(
     const int q_thread_idx = q_start_idx + tid;
     const bool valid_q_thread = q_thread_idx < seq_len;
 
-    // Shared memory for blocks
+    // Shared memory for blocks (now using tiles)
     threadgroup DTYPE s_query[ActualBlockSize][ActualHeadDim];
     threadgroup DTYPE s_key[ActualBlockSize][ActualHeadDim];
     threadgroup DTYPE s_value[ActualBlockSize][ActualHeadDim];
@@ -810,6 +807,7 @@ kernel void flash_attention_kernel_impl(
         const int q_offset = ((batch_idx * num_heads + head_idx) * seq_len + q_thread_idx) * ActualHeadDim;
 
         // Vectorized loading of query data
+        #pragma unroll 4
         for (int i = 0; i < ActualHeadDim; i += 4) {
             float4 chunk;
             if (i + 3 < ActualHeadDim) {
@@ -832,7 +830,7 @@ kernel void flash_attention_kernel_impl(
         }
 
         // Apply RoPE to query vector if enabled
-        //apply_rope_impl<DTYPE, ActualHeadDim>(q_vec, q_thread_idx, rope_params, ActualHeadDim);
+        apply_rope_impl<DTYPE, ActualHeadDim>(q_vec, q_thread_idx, rope_params, ActualHeadDim);
 
         // Store in shared memory
         for (int i = 0; i < ActualHeadDim; ++i) {
@@ -843,8 +841,13 @@ kernel void flash_attention_kernel_impl(
     // Wait for all threads to finish loading query data
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Process all key blocks
+    // Process all key blocks using tiled approach
     const int num_k_blocks = (seq_len + ActualBlockSize - 1) / ActualBlockSize;
+    
+    // Calculate number of tiles for both the query dimension and key dimension
+    const int num_tiles_q = (ActualBlockSize + TILE_SIZE_Q - 1) / TILE_SIZE_Q;
+    const int num_tiles_k_per_block = (ActualBlockSize + TILE_SIZE_K - 1) / TILE_SIZE_K;
+    const int num_tiles_d = (ActualHeadDim + 4 - 1) / 4; // Tile along head dimension by 4
 
     for (int k_block_idx = 0; k_block_idx < num_k_blocks; ++k_block_idx) {
         // Skip this block if it's not in the sparse mask
@@ -854,7 +857,7 @@ kernel void flash_attention_kernel_impl(
 
         // Calculate starting position for this key block
         const int k_start_idx = k_block_idx * ActualBlockSize;
-
+        
         // Collaboratively load key and value blocks into shared memory
         const int k_thread_idx = k_start_idx + tid;
         const bool valid_k_thread = k_thread_idx < seq_len;
@@ -865,6 +868,7 @@ kernel void flash_attention_kernel_impl(
 
             // Load key into shared memory - vectorized
             thread DTYPE k_vec[ActualHeadDim]; // This is a per-thread temporary for loading
+            #pragma unroll 4
             for (int i = 0; i < ActualHeadDim; i += 4) {
                 float4 chunk;
                 if (i + 3 < ActualHeadDim) {
@@ -887,7 +891,7 @@ kernel void flash_attention_kernel_impl(
             }
 
             // Apply RoPE to key vector if enabled
-            //apply_rope_impl<DTYPE, ActualHeadDim>(k_vec, k_thread_idx, rope_params, ActualHeadDim);
+            apply_rope_impl<DTYPE, ActualHeadDim>(k_vec, k_thread_idx, rope_params, ActualHeadDim);
 
             // Store in shared memory
             for (int i = 0; i < ActualHeadDim; ++i) {
@@ -895,6 +899,7 @@ kernel void flash_attention_kernel_impl(
             }
 
             // Load value into shared memory - vectorized
+            #pragma unroll 4
             for (int i = 0; i < ActualHeadDim; i += 4) {
                 float4 chunk;
                 if (i + 3 < ActualHeadDim) {
@@ -919,59 +924,79 @@ kernel void flash_attention_kernel_impl(
 
         // Wait for all threads to finish loading key/value data
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Process attention for this query against all keys in this block
+        
+        // Check if we're operating on a valid query position
         if (valid_q_thread) {
-            const int k_block_limit = min(ActualBlockSize, seq_len - k_start_idx);
-
-            for (int k_idx = 0; k_idx < k_block_limit; ++k_idx) {
-                const int abs_k_idx = k_start_idx + k_idx;
-
-                // Causal masking for self-attention
-                // In self-attention, the query should not attend to future positions
-                if (q_thread_idx < abs_k_idx) {
-                    continue; // Skip if key position is after query position
-                }
+            // Tiled matrix multiplication for attention mechanism
+            // Each thread processes attention for its query against all keys in this block
+            // Now using tiles for better cache locality
+            
+            const int q_tile_idx = tid / TILE_SIZE_Q;
+            const int q_local_idx = tid % TILE_SIZE_Q;
+            
+            // Only do processing if this thread's tile is valid
+            if (q_tile_idx < num_tiles_q) {
+                const int k_block_limit = min(ActualBlockSize, seq_len - k_start_idx);
                 
-                // Compute attention score
-                float score = compute_attention_score_impl<DTYPE, ActualHeadDim>(q_vec, s_key[k_idx], scale_factor);
-
-                // Apply softmax normalization - optimized numerical stability method
-                if (score > max_score) {
-                    // When we find a new maximum, rescale previous contributions
-                    const float scale = metal::fast::exp(max_score - score);
-                    sum_exp *= scale;
-                    for (int i = 0; i < ActualHeadDim; i += 4) {
-                        float4 scaled_accum;
-                        scaled_accum.x = accum[i] * scale;
-                        if (i + 1 < ActualHeadDim) scaled_accum.y = accum[i+1] * scale;
-                        if (i + 2 < ActualHeadDim) scaled_accum.z = accum[i+2] * scale;
-                        if (i + 3 < ActualHeadDim) scaled_accum.w = accum[i+3] * scale;
-
-                        accum[i] = scaled_accum.x;
-                        if (i + 1 < ActualHeadDim) accum[i+1] = scaled_accum.y;
-                        if (i + 2 < ActualHeadDim) accum[i+2] = scaled_accum.z;
-                        if (i + 3 < ActualHeadDim) accum[i+3] = scaled_accum.w;
+                // Process key/value tiles
+                for (int kt = 0; kt < num_tiles_k_per_block; ++kt) {
+                    const int k_tile_start = kt * TILE_SIZE_K;
+                    const int k_tile_end = min(k_tile_start + TILE_SIZE_K, k_block_limit);
+                    
+                    // Process keys within this tile
+                    for (int k_idx = k_tile_start; k_idx < k_tile_end; ++k_idx) {
+                        const int abs_k_idx = k_start_idx + k_idx;
+                        
+                        // Causal masking for self-attention
+                        if (q_thread_idx < abs_k_idx) {
+                            continue; // Skip if key position is after query position
+                        }
+                        
+                        // Compute attention score in a memory-efficient way
+                        // Using tiled approach to improve cache locality
+                        float score = 0.0f;
+                        
+                        // Process the head dimension in tiles for better cache locality
+                        for (int dt = 0; dt < num_tiles_d; ++dt) {
+                            const int d_start = dt * 4;
+                            const int d_end = min(d_start + 4, ActualHeadDim);
+                            
+                            // Compute partial dot product for this tile
+                            for (int d = d_start; d < d_end; ++d) {
+                                score += static_cast<float>(q_vec[d]) * static_cast<float>(s_key[k_idx][d]);
+                            }
+                        }
+                        
+                        // Apply scaling factor
+                        score *= scale_factor;
+                        
+                        // Apply softmax normalization - optimized numerical stability method
+                        if (score > max_score) {
+                            // When we find a new maximum, rescale previous contributions
+                            const float scale = metal::fast::exp(max_score - score);
+                            sum_exp *= scale;
+                            
+                            // Scale accumulators
+                            for (int d = 0; d < ActualHeadDim; ++d) {
+                                accum[d] *= scale;
+                            }
+                            
+                            max_score = score;
+                        }
+                        
+                        const float exp_score = metal::fast::exp(score - max_score);
+                        sum_exp += exp_score;
+                        
+                        // Update output with weighted value using tiled approach for memory efficiency
+                        for (int dt = 0; dt < num_tiles_d; ++dt) {
+                            const int d_start = dt * 4;
+                            const int d_end = min(d_start + 4, ActualHeadDim);
+                            
+                            for (int d = d_start; d < d_end; ++d) {
+                                accum[d] += exp_score * static_cast<float>(s_value[k_idx][d]);
+                            }
+                        }
                     }
-                    max_score = score;
-                }
-
-                const float exp_score = metal::fast::exp(score - max_score);
-                sum_exp += exp_score;
-
-                // Update output with weighted value - vectorized
-                #pragma unroll 4
-                for (int i = 0; i < ActualHeadDim; i += 4) {
-                    float4 value_chunk;
-                    value_chunk.x = s_value[k_idx][i];
-                    if (i + 1 < ActualHeadDim) value_chunk.y = s_value[k_idx][i+1];
-                    if (i + 2 < ActualHeadDim) value_chunk.z = s_value[k_idx][i+2];
-                    if (i + 3 < ActualHeadDim) value_chunk.w = s_value[k_idx][i+3];
-
-                    accum[i] += exp_score * value_chunk.x;
-                    if (i + 1 < ActualHeadDim) accum[i+1] += exp_score * value_chunk.y;
-                    if (i + 2 < ActualHeadDim) accum[i+2] += exp_score * value_chunk.z;
-                    if (i + 3 < ActualHeadDim) accum[i+3] += exp_score * value_chunk.w;
                 }
             }
         }
@@ -989,6 +1014,7 @@ kernel void flash_attention_kernel_impl(
         const float inv_sum = 1.0f / (sum_exp + epsilon);
 
         // Write the normalized weighted values to output - vectorized
+        #pragma unroll 4
         for (int i = 0; i < ActualHeadDim; i += 4) {
             float4 out_chunk;
             out_chunk.x = accum[i] * inv_sum;
@@ -1033,7 +1059,7 @@ INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 16);   // Shared mem: 32*16*3*4   
 INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 32);   // Shared mem: 32*32*3*4   = 12288 bytes (12KB). OK.
 INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 64);   // Shared mem: 32*64*3*4   = 24576 bytes (24KB). OK.
 INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 80);   // Shared mem: 32*80*3*4   = 30720 bytes (30KB). OK.
-// INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 128);  // Shared mem: 32*128*3*4 = 49152 bytes (48KB). EXCEEDS 32KB LIMIT.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 128);  // Shared mem: 32*128*3*4 = 49152 bytes (48KB). EXCEEDS 32KB LIMIT.
 
 
 // Instantiate for common half cases
