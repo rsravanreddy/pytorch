@@ -830,7 +830,7 @@ kernel void flash_attention_kernel_impl(
         }
 
         // Apply RoPE to query vector if enabled
-        apply_rope_impl<DTYPE, ActualHeadDim>(q_vec, q_thread_idx, rope_params, ActualHeadDim);
+        //apply_rope_impl<DTYPE, ActualHeadDim>(q_vec, q_thread_idx, rope_params, ActualHeadDim);
 
         // Store in shared memory
         for (int i = 0; i < ActualHeadDim; ++i) {
@@ -851,9 +851,9 @@ kernel void flash_attention_kernel_impl(
 
     for (int k_block_idx = 0; k_block_idx < num_k_blocks; ++k_block_idx) {
         // Skip this block if it's not in the sparse mask
-        if (!is_block_in_mask(q_block_idx, k_block_idx, sparse_info)) {
-            continue;
-        }
+        //if (!is_block_in_mask(q_block_idx, k_block_idx, sparse_info)) {
+        //    continue;
+        //}
 
         // Calculate starting position for this key block
         const int k_start_idx = k_block_idx * ActualBlockSize;
@@ -891,7 +891,7 @@ kernel void flash_attention_kernel_impl(
             }
 
             // Apply RoPE to key vector if enabled
-            apply_rope_impl<DTYPE, ActualHeadDim>(k_vec, k_thread_idx, rope_params, ActualHeadDim);
+            //apply_rope_impl<DTYPE, ActualHeadDim>(k_vec, k_thread_idx, rope_params, ActualHeadDim);
 
             // Store in shared memory
             for (int i = 0; i < ActualHeadDim; ++i) {

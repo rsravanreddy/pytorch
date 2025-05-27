@@ -565,13 +565,13 @@ std::cout << "scaled_dot_product_attention_mps" << std::endl;
   bool supports_fast_sdpa = !is_causal && supports_sdpa_vector;
 
   // if none of the fast paths apply, fall back to the generic mps graph solution
-  if (dropout_p > 0) {
-    std::cout << "dropout_p > 0" << std::endl;
-      dropout_p = 0.0;
-  }else{
-      return flash_mps(q_, k_, v_, mask_, 0.0, is_causal, dropout_mask, scale, query, unsqueezed);
+  // if (dropout_p == 0) {
+  //   std::cout << "dropout_p > 0" << std::endl;
+  //     dropout_p = 0.0;
+  // }else{
+  //     return flash_mps(q_, k_, v_, mask_, 0.0, is_causal, dropout_mask, scale, query, unsqueezed);
 
-  }
+  // }
 
   // dispatch to the fast SDPA implementation
   auto is_contiguous_or_head_seq_transposed = [](const Tensor& t) -> bool {
@@ -588,6 +588,13 @@ std::cout << "scaled_dot_product_attention_mps" << std::endl;
   Tensor v_contig = v_.contiguous();
 
   // for short sequences, differentiate based on key sequence length
+  if(is_causal){
+      return flash_mps(q_contig, k_contig, v_contig, mask_, 0.0, true, dropout_mask, scale, query, unsqueezed);
+  }else{
+    is_causal = true; // reset causal flag for the fast path
+  }
+
+
   if ((k_.size(2) >= 1024) || (k_.size(1) < q_.size(1) && k_.size(2) >= 4096)) {
     return sdpa_vector_2pass_mps(
         q_contig, k_contig, v_contig, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
