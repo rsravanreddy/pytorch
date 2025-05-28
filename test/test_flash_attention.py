@@ -1,134 +1,135 @@
 import torch
-import time
+import torch.nn.functional as F
+import torch.utils.benchmark as benchmark
+import itertools
 
-def run_sdpa_mps_test(
-    B, H, Mq, Mk, D,
-    is_causal,
-    dtype=torch.float32,
-    custom_scale=None,
-    test_description=""
-):
+def create_inputs(batch_size, num_heads, seq_len_q, seq_len_kv, head_dim, dtype, device):
     """
-    Runs a scaled dot-product attention test on MPS, designed to hit
-    the sdpa_flash_attention_explicit_simd_mps path under correct conditions.
-    Compares the output with a CPU reference.
+    Helper function to create random input tensors for attention.
     """
-    print(f"\n--- Running Test: {test_description} ---")
-    print(f"Params: B={B}, H={H}, Mq={Mq}, Mk={Mk}, D={D}, causal={is_causal}, dtype={dtype}, scale={custom_scale}")
+    q_shape = (batch_size, num_heads, seq_len_q, head_dim)
+    kv_shape = (batch_size, num_heads, seq_len_kv, head_dim)
 
+    q = torch.randn(q_shape, dtype=dtype, device=device)
+    k = torch.randn(kv_shape, dtype=dtype, device=device)
+    v = torch.randn(kv_shape, dtype=dtype, device=device)
+    return q, k, v
+
+def run_benchmark():
+    # Check for MPS availability
     if not torch.backends.mps.is_available():
-        print("[SKIPPED] MPS not available.")
+        print("MPS not available. Skipping benchmark.")
         return
-      
-    # # Check conditions for sdpa_flash_attention_explicit_simd_mps
-    # if not (D in [64, 80, 128] and Mq >= 32):
-    #     print(f"[INFO] This configuration (D={D}, Mq={Mq}) might not hit the target flash kernel path. Testing general SDPA.")
+    device = torch.device("mps")
 
-    # if dtype == torch.float16 and hasattr(torch.mps, "is_macos13_or_newer") and not torch.mps.is_macos13_or_newer():
-    #     print(f"[SKIPPED] float16 on MPS requires newer macOS for reliable testing via this script.")
-    #     return
-
+    # Try to access the custom op to ensure it's loaded
     try:
-        # Create tensors on MPS
-        # (batch_size, seq_len, num_heads, head_dim)
-        torch.manual_seed(42)  # For reproducibility
-        q_mps = torch.randn(B, H, Mq, D, device='mps', dtype=dtype)
-        k_mps = torch.randn(B, H, Mk, D, device='mps', dtype=dtype)
-        v_mps = torch.randn(B, H, Mk, D, device='mps', dtype=dtype)
+        _ = torch.ops.mps_custom.flash_attention_mps
+    except AttributeError:
+        print("Custom op 'mps_custom.flash_attention_mps' not found.")
+        print("Please ensure PyTorch is compiled with this custom operator registered.")
+        return
 
-        # MPS execution
-        # Ensure attn_mask=None and dropout_p=0.0 to meet kernel conditions
-        torch.mps.synchronize() # Ensure previous ops are done
-        start_time_mps = time.time()
-        sdpa_result_mps = torch.nn.functional.scaled_dot_product_attention(
-            q_mps, k_mps, v_mps,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=is_causal,
-            scale=custom_scale
-        )
-        # Handle cases where only one output is returned
-        if isinstance(sdpa_result_mps, tuple):
-            output_mps, _ = sdpa_result_mps
-        else:
-            output_mps = sdpa_result_mps
-        torch.mps.synchronize() # Ensure SDPA is done
-        end_time_mps = time.time()
-        mps_duration = (end_time_mps - start_time_mps) * 1000  # milliseconds
+    # Define configurations: (Batch, Heads, SeqLen_Q, SeqLen_KV, Head_Dim, DType, Is_Causal)
+    # Using common head dimensions like 64, 96, 128 for which kernels are often optimized/available.
+    configs = [
+        # B, H, Sq, Skv, D, dtype, is_causal_flag
+        # --- Causal Cases ---
+        (1, 8, 64, 64, 64, torch.float32, True),
+        (4, 16, 128, 128, 64, torch.float32, True),
+        (1, 8, 512, 512, 64, torch.float16, True),
+        (2, 12, 1024, 1024, 96, torch.float32, True),
+        (1, 8, 2048, 2048, 64, torch.float16, True),
 
-        # CPU reference
-        q_cpu = q_mps.cpu()
-        k_cpu = k_mps.cpu()
-        v_cpu = v_mps.cpu()
+        # --- Non-Causal, No Mask Cases ---
+        (1, 8, 64, 64, 64, torch.float32, False),
+        (4, 16, 128, 128, 64, torch.float32, False),
+        (1, 8, 512, 512, 64, torch.float16, False),
+        (2, 12, 1024, 1024, 96, torch.float32, False),
+        (1, 8, 2048, 2048, 64, torch.float16, False),
 
-        # For CPU reference, is_causal flag works directly.
-        # No need to manually create a boolean mask if using the flag.
-        sdpa_result_cpu = torch.nn.functional.scaled_dot_product_attention(
-            q_cpu, k_cpu, v_cpu,
-            attn_mask=None, # Match MPS call
-            dropout_p=0.0,  # Match MPS call
-            is_causal=is_causal,
-            scale=custom_scale
-        )
-        # Handle cases where only one output is returned for CPU as well for consistency
-        if isinstance(sdpa_result_cpu, tuple):
-            output_cpu, _ = sdpa_result_cpu
-        else:
-            output_cpu = sdpa_result_cpu
+        # --- Short Query, Long Key (may trigger different paths in native SDPA) ---
+        (1, 8, 8, 1024, 64, torch.float32, False), # Non-causal, no mask
+        (1, 8, 8, 1024, 64, torch.float32, True),  # Causal
+    ]
+
+    all_results = []
+
+    for B, H, Sq, Skv, D, dtype, is_causal_flag in configs:
+        config_str = f"B={B}, H={H}, Sq={Sq}, Skv={Skv}, D={D}, {dtype}, causal={is_causal_flag}"
+        print(f"\nBenchmarking Config: {config_str}")
+
+        try:
+            q, k, v = create_inputs(B, H, Sq, Skv, D, dtype, device)
+
+            # --- Benchmark mps_custom::flash_attention_mps ---
+            custom_op_label = "mps_custom.flash_attention_mps"
+            # attn_mask is None, dropout_p=0.0, dropout_mask=None, scale=None
+            custom_op_stmt = "torch.ops.mps_custom.flash_attention_mps(q, k, v, None, 0.0, is_causal_val, None, None)"
             
-        # Comparison
-        rtol = 1e-2 if dtype == torch.float16 else 1e-4 # Adjusted rtol for float32
-        atol = 1e-2 if dtype == torch.float16 else 1e-5 # Adjusted atol for float32
+            # Warmup for custom op
+            for _ in range(5):
+                _ = torch.ops.mps_custom.flash_attention_mps(q, k, v, None, 0.0, is_causal_flag, None, None)
+            torch.mps.synchronize() # Ensure warmup is complete
 
-        ctril = torch.tril(output_cpu);
-        # print(f"Output shapes: MPS: {torch.tril(output_mps)}, CPU: {torch.tril(output_cpu)}")
-        if torch.allclose(output_mps.cpu(), output_cpu, rtol=rtol, atol=atol):
-            print(f"[PASSED] Outputs match. MPS Duration: {mps_duration:.3f} ms")
-        else:
-            print(f"[FAILED] Outputs DO NOT match. MPS Duration: {mps_duration:.3f} ms")
-            # For debugging, you can print max difference:
-            # diff = torch.abs(output_mps.cpu() - output_cpu)
-            # print(f"Max difference: {diff.max().item()}")
+            t_custom = benchmark.Timer(
+                stmt=custom_op_stmt,
+                globals={'q': q, 'k': k, 'v': v, 'is_causal_val': is_causal_flag, 'torch': torch},
+                label="ScaledDotProductAttention",
+                sub_label=f"CustomOp ({config_str})",
+                description=custom_op_label
+            ).blocked_autorange(min_run_time=1.0)
+            all_results.append(t_custom)
+            print(f"  {custom_op_label:<35}: {t_custom}")
 
-    except Exception as e:
-        print(f"[ERRORED] An error occurred: {e}")
-        import traceback
-        traceback.print_exc()
-        
+            # --- Benchmark torch.nn.functional.scaled_dot_product_attention (MPS backend) ---
+            native_op_label = "F.scaled_dot_product_attention"
+            # attn_mask is None, dropout_p=0.0, scale=None
+            native_op_stmt = "F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=is_causal_val)"
 
+            # Warmup for native op
+            for _ in range(5):
+                _ = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=is_causal_flag)
+            torch.mps.synchronize() # Ensure warmup is complete
+
+            t_native = benchmark.Timer(
+                stmt=native_op_stmt,
+                globals={'q': q, 'k': k, 'v': v, 'is_causal_val': is_causal_flag, 'F': F},
+                label="ScaledDotProductAttention",
+                sub_label=f"NativeOp ({config_str})",
+                description=native_op_label
+            ).blocked_autorange(min_run_time=1.0)
+            all_results.append(t_native)
+            print(f"  {native_op_label:<35}: {t_native}")
+
+            # --- Optional: Correctness Check (for one configuration or if needed) ---
+            if B==1 and H==8 and Sq==64 and D==64 and dtype==torch.float32 : # Example condition
+                print("  Running correctness check...")
+                out_custom, _ = torch.ops.mps_custom.flash_attention_mps(q, k, v, None, 0.0, is_causal_flag, None, None)
+                out_native = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=is_causal_flag)
+                
+                # Adjust tolerance based on dtype
+                atol = 1e-3 if dtype == torch.float16 else 1e-5
+                rtol = 1e-3 if dtype == torch.float16 else 1e-4
+
+                if torch.allclose(out_custom, out_native, atol=atol, rtol=rtol):
+                    print("    Correctness check PASSED.")
+                else:
+                    print("    Correctness check FAILED.")
+                    # diff = torch.abs(out_custom - out_native)
+                    # print(f"    Max difference: {diff.max()}")
+
+        except RuntimeError as e:
+            print(f"  Error during benchmarking for config {config_str}: {e}")
+            print(f"  Skipping this configuration.")
+            continue
+
+    if all_results:
+        print("\n" + "="*40 + " Benchmark Summary " + "="*40)
+        compare = benchmark.Compare(all_results)
+        compare.print()
+    else:
+        print("\nNo benchmark results to display.")
 
 if __name__ == '__main__':
-    print("Starting direct SDPA MPS tests...")
-    # Configurations that should hit sdpa_flash_attention_explicit_simd_mps
-    
-    configs_to_test = [
-        # {"B": 1, "H": 1, "Mq": 64, "Mk": 64, "D": 64, "is_causal": True, "dtype": torch.float32, "desc": "Non-Causal D64 Mq64"},
-    #     {"B": 1, "H": 2, "Mq": 128, "Mk": 128, "D": 64, "is_causal": True, "dtype": torch.float32, "desc": "Causal D64 Mq128"},
-    #     {"B": 2, "H": 4, "Mq": 256, "Mk": 128, "D": 128, "is_causal": False, "dtype": torch.float32, "desc": "Non-Causal D128 Mq256"},
-    #     {"B": 1, "H": 1, "Mq": 512, "Mk": 512, "D": 80, "is_causal": True, "dtype": torch.float32, "desc": "Causal D80 Mq512"},
-    #     {"B": 1, "H": 2, "Mq": 64, "Mk": 64, "D": 64, "is_causal": False, "dtype": torch.float16, "desc": "Non-Causal D64 Mq64 fp16"},
-    #     {"B": 1, "H": 2, "Mq": 128, "Mk": 128, "D": 64, "is_causal": True, "dtype": torch.float16, "desc": "Causal D64 Mq128 fp16"},
-    #     {"B": 1, "H": 1, "Mq": 1024, "Mk": 1024, "D": 128, "is_causal": False, "dtype": torch.float32, "desc": "Long Seq Non-Causal D128 Mq1024"},
-    #     {"B": 1, "H": 1, "Mq": 32, "Mk": 32, "D": 64, "is_causal": False, "dtype": torch.float32, "desc": "Boundary Mq=32 Non-Causal D64"},
-    ]
-
-    # Configurations that might *not* hit sdpa_flash_attention_explicit_simd_mps (should fall back)
-    #(batch_size, seq_len, num_heads, head_dim)
-
-    configs_fallback = [
-        {"B": 1, "H": 1, "Mq": 64, "Mk": 64, "D": 1, "is_causal": True, "dtype": torch.float32, "desc": "Short Mq (<32) Non-Causal D64"},
-        {"B": 10, "H": 10, "Mq": 128, "Mk": 128, "D": 32, "is_causal": True, "dtype": torch.float32, "desc": "Unsupported D (32) Non-Causal D32 Mq64"},
-        {"B": 1, "H": 1, "Mq": 32, "Mk": 32, "D": 32, "is_causal": True, "dtype": torch.float32, "desc": "Unsupported D (32) Non-Causal D32 Mq64"},
-        {"B": 12, "H": 16, "Mq": 256, "Mk": 256, "D": 128, "is_causal": True, "dtype": torch.float32, "desc": "Unsupported D (32) Non-Causal D32 Mq64"},
-        {"B": 12, "H": 16, "Mq": 512, "Mk": 512, "D": 128, "is_causal": True, "dtype": torch.float32, "desc": "Unsupported D (32) Non-Causal D32 Mq64"},
-
-    ]
-
-    for config in configs_to_test + configs_fallback:
-        run_sdpa_mps_test( 
-            B=config["B"], H=config["H"], Mq=config["Mq"], Mk=config["Mk"], D=config["D"],
-            is_causal=config["is_causal"], dtype=config["dtype"],
-            test_description=config["desc"]
-        )
-
-    print("\nDirect SDPA MPS testing finished.")
+    run_benchmark()
