@@ -8,6 +8,7 @@
 #include <ATen/native/mps/OperationUtils.h>
 #include <ATen/native/transformers/attention.h>
 #include <ATen/native/transformers/sdp_utils_cpp.h>
+#include <torch/library.h>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -60,7 +61,7 @@ static std::tuple<Tensor, Tensor> sdpa_general_mps(const Tensor& query,
     MPSGraphTensor* outputTensor = nil;
     MPSGraphTensor* attnTensor = nil;
   };
-  std::cout << "general_mps" << std::endl;
+  //std::cout << "general_mps" << std::endl;
   const auto macOS15_0_plus = is_macos_13_or_newer(MacOSVersion::MACOS_VER_15_0_PLUS);
   int64_t batchSize = query.size(0);
   int64_t num_head = query.size(1);
@@ -181,7 +182,7 @@ static std::tuple<Tensor, Tensor> flash_mps(const Tensor& q_,
   uint k_seq_stride = k_.stride(2);
   uint v_head_stride = v_.stride(1);
   uint v_seq_stride = v_.stride(2);
-  std::cout << "flash_mps" << std::endl;
+  // std::cout << "flash_mps" << std::endl;
   auto out = at::empty({batchSize, num_head, qSize, headSize}, q_.options());
   auto attn = at::empty({batchSize, num_head, qSize, maxSeqLength}, q_.options());
   auto scale_factor = sdp::calculate_scale(q_, scale).expect_float();
@@ -242,7 +243,8 @@ static std::tuple<Tensor, Tensor> flash_mps(const Tensor& q_,
                   sparseInfo,
                   batchSize,
                   num_head,
-                  qSize // This corresponds to seq_len in the kernel (buffer 8)
+                  qSize, // This corresponds to seq_len in the kernel (buffer 8)
+                  is_causal
                   );
       [computeEncoder dispatchThreadgroups:grid_dims threadsPerThreadgroup:group_dims];
     }
@@ -284,7 +286,7 @@ static std::tuple<Tensor, Tensor> sdpa_vector_fast_mps(const Tensor& q_,
   uint k_seq_stride = k_.stride(2);
   uint v_head_stride = v_.stride(1);
   uint v_seq_stride = v_.stride(2);
-
+  //std::cout << "sdpa_vector_fast_mps" << std::endl;
   auto out = at::empty({batchSize, num_head, qSize, headSize}, q_.options());
   auto attn = at::empty({batchSize, num_head, qSize, maxSeqLength}, q_.options());
   auto scale_factor = sdp::calculate_scale(q_, scale).expect_float();
@@ -359,7 +361,7 @@ static std::tuple<Tensor, Tensor> sdpa_vector_2pass_mps(const Tensor& q_,
   uint k_seq_stride = k_.stride(2);
   uint v_head_stride = v_.stride(1);
   uint v_seq_stride = v_.stride(2);
-
+  //std::cout << "sdpa_vector_2pass_mps" << std::endl;
   auto out = at::empty({batchSize, num_heads, seq_len_q, headSize}, q_.options());
   auto intermediate = at::empty({batchSize, num_heads, seq_len_q, blocks, headSize}, q_.options());
   auto sums = at::empty({batchSize, num_heads, seq_len_q, blocks}, q_.options());
@@ -526,9 +528,6 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math_mps(const Tensor& 
                                                                   bool is_causal,
                                                                   const std::optional<Tensor>& dropout_mask,
                                                                   std::optional<double> scale) {
-                                                                    
- 
-std::cout << "scaled_dot_product_attention_mps" << std::endl; 
   auto query_tuple = ensure_4d(query);
   Tensor q_ = std::get<0>(query_tuple);
   bool unsqueezed = std::get<1>(query_tuple);
@@ -565,13 +564,9 @@ std::cout << "scaled_dot_product_attention_mps" << std::endl;
   bool supports_fast_sdpa = !is_causal && supports_sdpa_vector;
 
   // if none of the fast paths apply, fall back to the generic mps graph solution
-  // if (dropout_p == 0) {
-  //   std::cout << "dropout_p > 0" << std::endl;
-  //     dropout_p = 0.0;
-  // }else{
-  //     return flash_mps(q_, k_, v_, mask_, 0.0, is_causal, dropout_mask, scale, query, unsqueezed);
-
-  // }
+  if (!supports_fast_sdpa) {
+    return sdpa_general_mps(q_, k_, v_, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
+  }
 
   // dispatch to the fast SDPA implementation
   auto is_contiguous_or_head_seq_transposed = [](const Tensor& t) -> bool {
@@ -588,13 +583,6 @@ std::cout << "scaled_dot_product_attention_mps" << std::endl;
   Tensor v_contig = v_.contiguous();
 
   // for short sequences, differentiate based on key sequence length
-  if(is_causal){
-      return flash_mps(q_contig, k_contig, v_contig, mask_, 0.0, true, dropout_mask, scale, query, unsqueezed);
-  }else{
-    is_causal = true; // reset causal flag for the fast path
-  }
-
-
   if ((k_.size(2) >= 1024) || (k_.size(1) < q_.size(1) && k_.size(2) >= 4096)) {
     return sdpa_vector_2pass_mps(
         q_contig, k_contig, v_contig, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
@@ -603,5 +591,61 @@ std::cout << "scaled_dot_product_attention_mps" << std::endl;
         q_contig, k_contig, v_contig, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
   }
 }
+// Wrapper function for custom op registration
+static std::tuple<Tensor, Tensor> _flash_attention_mps_for_custom_op(
+    const Tensor& query,
+    const Tensor& key,
+    const Tensor& value,
+    const std::optional<Tensor>& attn_mask,
+    double dropout_p,
+    bool is_causal,
+    const std::optional<Tensor>& dropout_mask,
+    std::optional<double> scale) {
+
+    // Perform the same preprocessing as _scaled_dot_product_attention_math_mps
+    auto query_tuple = ensure_4d(query);
+    Tensor q_ = std::get<0>(query_tuple);
+    bool unsqueezed = std::get<1>(query_tuple);
+
+    auto key_tuple = ensure_4d(key);
+    Tensor k_ = std::get<0>(key_tuple);
+
+    auto value_tuple = ensure_4d(value);
+    Tensor v_ = std::get<0>(value_tuple);
+
+    std::optional<Tensor> mask_4d;
+    if (attn_mask.has_value()) {
+      // This expansion logic ensures the mask is compatible with the 4D tensors.
+      // It mirrors the logic in _scaled_dot_product_attention_math_mps.
+      // Target shape for mask is [B, H, Sq, Sk] or broadcastable.
+      // q_ and k_ are already 4D: [Batch*, Num_Heads, Seq_Len, Head_Dim]
+      // We expand based on original query's batch/head structure and k_'s sequence length.
+      auto maskExpandedDims = query.sizes().vec();
+      if (!maskExpandedDims.empty()) { // Ensure query is not a 0-dim tensor
+        maskExpandedDims[maskExpandedDims.size() - 1] = k_.size(2); // k_seq_len for the last dim
+      }
+      Tensor expanded_attn_mask = attn_mask.value().expand(maskExpandedDims);
+      std::tie(expanded_attn_mask, std::ignore) = ensure_4d(expanded_attn_mask);
+      mask_4d = expanded_attn_mask;
+    }
+
+    // Call flash_mps directly. Note: dropout_p and dropout_mask are accepted for signature
+    // consistency but might not be used by the flash_mps kernel.
+    std::optional<double> scale_double;
+    if (scale.has_value()) {
+        scale_double = static_cast<double>(scale.value());
+    }
+    return flash_mps(q_, k_, v_, mask_4d,
+                     static_cast<double>(dropout_p), // cast float to double
+                     is_causal, dropout_mask, scale_double, query, unsqueezed);
+}
 } // namespace native
 } // namespace at
+
+TORCH_LIBRARY(mps_custom, m) {
+  m.def("flash_attention_mps(Tensor query, Tensor key, Tensor value, Tensor? attn_mask, float dropout_p, bool is_causal, Tensor? dropout_mask, float? scale) -> (Tensor, Tensor)");
+}
+
+TORCH_LIBRARY_IMPL(mps_custom, MPS, m) {
+  m.impl("flash_attention_mps", TORCH_FN(at::native::_flash_attention_mps_for_custom_op));
+}

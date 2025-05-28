@@ -760,6 +760,7 @@ kernel void flash_attention_kernel_impl(
     constant int& batch_size [[buffer(6)]],
     constant int& num_heads [[buffer(7)]],
     constant int& seq_len [[buffer(8)]],
+    constant bool& is_causal [[buffer(9)]],
     uint tid [[thread_index_in_threadgroup]],
     uint bid [[threadgroup_position_in_grid]],
     uint threads_in_group [[threads_per_threadgroup]])
@@ -829,9 +830,6 @@ kernel void flash_attention_kernel_impl(
             }
         }
 
-        // Apply RoPE to query vector if enabled
-        //apply_rope_impl<DTYPE, ActualHeadDim>(q_vec, q_thread_idx, rope_params, ActualHeadDim);
-
         // Store in shared memory
         for (int i = 0; i < ActualHeadDim; ++i) {
             s_query[tid][i] = q_vec[i];
@@ -850,11 +848,6 @@ kernel void flash_attention_kernel_impl(
     const int num_tiles_d = (ActualHeadDim + 4 - 1) / 4; // Tile along head dimension by 4
 
     for (int k_block_idx = 0; k_block_idx < num_k_blocks; ++k_block_idx) {
-        // Skip this block if it's not in the sparse mask
-        //if (!is_block_in_mask(q_block_idx, k_block_idx, sparse_info)) {
-        //    continue;
-        //}
-
         // Calculate starting position for this key block
         const int k_start_idx = k_block_idx * ActualBlockSize;
         
@@ -889,10 +882,6 @@ kernel void flash_attention_kernel_impl(
                     if (i + 2 < ActualHeadDim) k_vec[i + 2] = key_ptr[kv_offset + i + 2];
                 }
             }
-
-            // Apply RoPE to key vector if enabled
-            //apply_rope_impl<DTYPE, ActualHeadDim>(k_vec, k_thread_idx, rope_params, ActualHeadDim);
-
             // Store in shared memory
             for (int i = 0; i < ActualHeadDim; ++i) {
                 s_key[tid][i] = k_vec[i];
@@ -948,7 +937,7 @@ kernel void flash_attention_kernel_impl(
                         const int abs_k_idx = k_start_idx + k_idx;
                         
                         // Causal masking for self-attention
-                        if (q_thread_idx < abs_k_idx) {
+                        if (is_causal && q_thread_idx < abs_k_idx) {
                             continue; // Skip if key position is after query position
                         }
                         
@@ -1044,6 +1033,7 @@ kernel void flash_attention_kernel_impl(
       constant int& batch_size [[buffer(6)]], \
       constant int& num_heads [[buffer(7)]], \
       constant int& seq_len [[buffer(8)]], \
+      constant bool& is_causal [[buffer(9)]], \
       uint tid [[thread_index_in_threadgroup]], \
       uint bid [[threadgroup_position_in_grid]], \
       uint threads_in_group [[threads_per_threadgroup]]);
@@ -1054,11 +1044,12 @@ kernel void flash_attention_kernel_impl(
 INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 16);   // Shared mem: 16*16*3*4   = 3072 bytes (3KB). OK.
 INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 32);   // Shared mem: 16*32*3*4   = 6144 bytes (6KB). OK.
 INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 64);   // Shared mem: 16*64*3*4   = 12288 bytes (12KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 96);   // Shared mem: 16*64*3*4   = 12288 bytes (12KB). OK.
 INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 16, 128);  // Shared mem: 16*128*3*4  = 24576 bytes (24KB). OK.
 INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 16);   // Shared mem: 32*16*3*4   = 6144 bytes (6KB). OK.
 INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 32);   // Shared mem: 32*32*3*4   = 12288 bytes (12KB). OK.
 INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 64);   // Shared mem: 32*64*3*4   = 24576 bytes (24KB). OK.
-INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 80);   // Shared mem: 32*80*3*4   = 30720 bytes (30KB). OK.
+INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 96);   // Shared mem: 32*64*3*4   = 24576 bytes (24KB). OK.
 INSTANTIATE_FLASH_ATTENTION_KERNEL(float, 32, 128);  // Shared mem: 32*128*3*4 = 49152 bytes (48KB). EXCEEDS 32KB LIMIT.
 
 
